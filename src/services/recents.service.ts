@@ -18,16 +18,20 @@ export interface RecentsMessageInput {
 }
 
 export class RecentsService {
-    private readonly storagePaths = createStoragePaths();
-    private readonly dataDir = this.storagePaths.recentsDir;
-    private readonly storePath = this.storagePaths.recentsPath;
+    private readonly storagePaths: ReturnType<typeof createStoragePaths>;
+    private readonly dataDir: string;
+    private readonly storePath: string;
     private store: RecentsStore = {
         conversations: [],
         messagesBySender: {},
         updatedAt: Date.now()
     };
 
-    constructor(private readonly sessionManager: SessionManager) {}
+    constructor(private readonly sessionManager: SessionManager, storageRoot?: string) {
+        this.storagePaths = storageRoot ? createStoragePaths(storageRoot, storageRoot) : createStoragePaths();
+        this.dataDir = this.storagePaths.recentsDir;
+        this.storePath = this.storagePaths.recentsPath;
+    }
 
     async ensureInitialized() {
         await ensureStorageRoots({

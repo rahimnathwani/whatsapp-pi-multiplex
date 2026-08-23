@@ -1,4 +1,4 @@
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { SessionManager } from './src/services/session.manager.js';
 import { WhatsAppService } from './src/services/whatsapp.service.js';
@@ -10,6 +10,8 @@ import { IncomingMediaService } from './src/services/incoming-media.service.js';
 import { WhatsAppPiLogger } from './src/services/whatsapp-pi.logger.js';
 import { ReactionSender } from './src/services/reaction.sender.js';
 import { initI18n, t } from './src/i18n.js';
+import { MultiplexClient } from './src/multiplex/client.js';
+import type { DeliveryPayload } from './src/multiplex/protocol.js';
 
 const shutdownState = globalThis as typeof globalThis & {
     __whatsappPiShutdown?: {
@@ -39,6 +41,27 @@ export default function (pi: ExtensionAPI) {
         type: "string",
         default: ""
     });
+
+    pi.registerFlag("whatsapp-multiplex-client", {
+        description: "Connect to whatsapp-pi-multiplex using this configured client ID",
+        type: "string",
+        default: ""
+    });
+
+    const multiplexFlag = pi.getFlag("whatsapp-multiplex-client");
+    const multiplexClientId = typeof multiplexFlag === 'string' ? multiplexFlag : '';
+    const isMultiplexMode = multiplexClientId.length > 0;
+    const multiplexClient = isMultiplexMode ? new MultiplexClient({
+        clientId: multiplexClientId,
+        socketPath: process.env.WHATSAPP_PI_ROUTER_SOCKET || '/run/whatsapp-pi/router.sock',
+        credentialFile: process.env.WHATSAPP_PI_CREDENTIAL_FILE || ''
+    }) : undefined;
+    let activeDelivery: DeliveryPayload | null = null;
+    const pendingDeliveries: DeliveryPayload[] = [];
+    let toolSentDeliveryId: string | null = null;
+    let agentRunning = false;
+    let activeDeliveryRunStarted = false;
+    let settledAssistantText = '';
 
     const sessionManager = new SessionManager();
     const whatsappService = new WhatsAppService(sessionManager);
@@ -104,6 +127,22 @@ export default function (pi: ExtensionAPI) {
         if (isVerbose) {
             logger.log('[WhatsApp-Pi] Verbose mode enabled - Baileys trace logs will be shown');
         }
+
+        if (isMultiplexMode) {
+            if (!process.env.WHATSAPP_PI_CREDENTIAL_FILE) {
+                throw new Error('WHATSAPP_PI_CREDENTIAL_FILE is required in multiplex client mode');
+            }
+            ctx.ui.setStatus('whatsapp', '| WhatsApp Multiplex: Connecting');
+            installGracefulShutdownHandlers();
+            shutdownState.__whatsappPiShutdown = {
+                installed: shutdownState.__whatsappPiShutdown?.installed ?? false,
+                stop: async () => { await multiplexClient?.stop(); }
+            };
+            await multiplexClient!.start();
+            ctx.ui.setStatus('whatsapp', '| WhatsApp Multiplex: Connected');
+            return;
+        }
+
         ctx.ui.setStatus('whatsapp', '| WhatsApp: Disconnected');
         whatsappService.setStatusCallback((status) => {
             ctx.ui.setStatus('whatsapp', formatFooterStatus(status));
@@ -293,18 +332,80 @@ export default function (pi: ExtensionAPI) {
         
     });
 
+    const activateDelivery = (delivery: DeliveryPayload) => {
+        activeDelivery = delivery;
+        activeDeliveryRunStarted = false;
+        settledAssistantText = '';
+        toolSentDeliveryId = null;
+        const participant = delivery.participant || delivery.routeJid.split('@')[0];
+        const header = delivery.routeJid.endsWith('@g.us')
+            ? `Message from ${delivery.pushName} (${participant}) in group ${delivery.routeJid}:`
+            : `Message from ${delivery.pushName} (${delivery.routeJid.split('@')[0]}):`;
+        if (delivery.image) {
+            pi.sendUserMessage([
+                { type: 'text', text: `${header} ${delivery.text}` },
+                { type: 'image', data: delivery.image.data, mimeType: delivery.image.mimeType }
+            ], { deliverAs: 'followUp' });
+        } else {
+            pi.sendUserMessage(`${header} ${delivery.text}`, { deliverAs: 'followUp' });
+        }
+    };
+
+    const activateNextDeliveryIfIdle = () => {
+        if (agentRunning || activeDelivery) return;
+        const next = pendingDeliveries.shift();
+        if (next) activateDelivery(next);
+    };
+
+    const advanceDelivery = (deliveryId: string) => {
+        if (activeDelivery?.deliveryId !== deliveryId) return;
+        activeDelivery = null;
+        activeDeliveryRunStarted = false;
+        settledAssistantText = '';
+        activateNextDeliveryIfIdle();
+    };
+
+    if (multiplexClient) {
+        multiplexClient.onDelivery((delivery) => {
+            // Pi queues follow-ups behind an existing run. Do not assign a reply
+            // scope until that unrelated run has fully ended.
+            if (agentRunning || activeDelivery) pendingDeliveries.push(delivery);
+            else activateDelivery(delivery);
+        });
+    }
+
     // Register send_wa_message tool (LLM-callable)
     pi.registerTool({
         name: "send_wa_message",
         label: "Send WhatsApp Message",
-        description: "Send a WhatsApp message to a contact or group. The 'jid' parameter is the WhatsApp JID (e.g. 5511999998888@s.whatsapp.net for contacts, or 120363012345@g.us for groups). If omitted, replies to the last conversation.",
-        promptSnippet: "send_wa_message(jid, message) - Send a WhatsApp message. jid is required (e.g. 5511999998888@s.whatsapp.net or 120363012345@g.us). IMPORTANT: After calling this tool, do NOT generate any follow-up text or confirmation — the message is already delivered to WhatsApp. Your entire response to the user should be sent ONLY through this tool, not repeated in chat.",
-        parameters: Type.Object({
+        description: isMultiplexMode ? "Reply to the active routed WhatsApp delivery." : "Send a WhatsApp message to a contact or group. The 'jid' parameter is the WhatsApp JID. If omitted, replies to the last conversation.",
+        promptSnippet: isMultiplexMode ? "send_wa_message(message) - Reply only to the active routed delivery. Do not repeat the response in chat." : "send_wa_message(jid, message) - Send a WhatsApp message. IMPORTANT: After calling this tool, do NOT generate any follow-up text or confirmation.",
+        parameters: isMultiplexMode ? Type.Object({
+            message: Type.String({ minLength: 1, description: "Plain-text reply for the active delivery" })
+        }) : Type.Object({
             jid: Type.Optional(Type.String({ description: "WhatsApp JID of the recipient" })),
             recipient_jid: Type.Optional(Type.String({ description: "Alternative name for jid" })),
             message: Type.String({ minLength: 1, description: "Plain-text message content to send" })
         }),
-        async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+        async execute(_toolCallId, params: { jid?: string; recipient_jid?: string; message: string }, _signal, _onUpdate, _ctx) {
+            if (isMultiplexMode) {
+                const delivery = activeDelivery;
+                if (!delivery || !multiplexClient) return {
+                    isError: true, details: undefined,
+                    content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: 'No active routed delivery' }) }]
+                };
+                // Once the tool attempts a delivery-scoped reply, never also send
+                // the assistant's final text. A transport failure may mean the
+                // router/WhatsApp accepted the reply but its result was lost.
+                toolSentDeliveryId = delivery.deliveryId;
+                try {
+                    const result = await multiplexClient.reply(delivery.deliveryId, params.message);
+                    return { isError: result.status !== 'sent', details: undefined, content: [{ type: 'text' as const, text: JSON.stringify(result) }] };
+                } catch (error) {
+                    return { isError: true, details: undefined, content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: error instanceof Error ? error.message : String(error) }) }] };
+                }
+            }
+
             // Resolve JID: jid > recipient_jid > lastRemoteJid > operatorJid (QR-scanned number)
             const resolvedJid = params.jid || params.recipient_jid || whatsappService.getLastRemoteJid() || whatsappService.getOperatorJid();
             if (!resolvedJid) {
@@ -360,6 +461,9 @@ export default function (pi: ExtensionAPI) {
             emoji: Type.String({ description: "Emoji to react with (e.g., 👍, ❤️, 😂). Use empty string to remove reaction." })
         }),
         async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+            if (isMultiplexMode) {
+                return { isError: true, details: undefined, content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: 'Reactions are unavailable in multiplex client mode' }) }] };
+            }
             // Get socket from WhatsApp service
             const socket = whatsappService.getSocket();
             if (!socket) {
@@ -398,6 +502,10 @@ export default function (pi: ExtensionAPI) {
             limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 20, description: "Maximum number of conversations to return (default 20)." }))
         }),
         async execute(_toolCallId, params) {
+            if (isMultiplexMode) return {
+                isError: true, details: undefined,
+                content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: 'Recents are router-owned and unavailable to multiplex clients' }) }]
+            };
             try {
                 const conversations = await recentsService.getRecentConversations();
                 let filtered = conversations;
@@ -435,6 +543,10 @@ export default function (pi: ExtensionAPI) {
             limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 20, description: "Maximum number of messages to return (default 20)." }))
         }),
         async execute(_toolCallId, params) {
+            if (isMultiplexMode) return {
+                isError: true, details: undefined,
+                content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: 'Recents are router-owned and unavailable to multiplex clients' }) }]
+            };
             if (!params.senderNumber || !params.senderNumber.trim()) {
                 return {
                     isError: true,
@@ -471,6 +583,10 @@ export default function (pi: ExtensionAPI) {
             sinceTimestamp: Type.Optional(Type.Integer({ minimum: 0, description: "Only include conversations whose last incoming message timestamp is strictly greater than this (ms since epoch)." }))
         }),
         async execute(_toolCallId, params) {
+            if (isMultiplexMode) return {
+                isError: true, details: undefined,
+                content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: 'Recents are router-owned and unavailable to multiplex clients' }) }]
+            };
             try {
                 const conversations = await recentsService.getRecentConversations();
                 const since = typeof params.sinceTimestamp === 'number' ? params.sinceTimestamp : 0;
@@ -500,6 +616,10 @@ export default function (pi: ExtensionAPI) {
         description: t("command.whatsapp.description"),
         handler: async (args, ctx) => {
             _ctx = ctx;
+            if (isMultiplexMode) {
+                ctx.ui.notify('Connection and routing are managed by the whatsapp-pi-multiplex router.', 'info');
+                return;
+            }
             await menuHandler.handleCommand(ctx);
 
             // Persist state after changes
@@ -514,6 +634,11 @@ export default function (pi: ExtensionAPI) {
 
     // Handle outgoing messages (Agent -> WhatsApp)
     pi.on("agent_start", async (_event, _ctx) => {
+        agentRunning = true;
+        if (isMultiplexMode) {
+            if (activeDelivery) activeDeliveryRunStarted = true;
+            return;
+        }
         if (sessionManager.getStatus() !== 'connected') return;
         const lastJid = whatsappService.getLastRemoteJid();
         if (lastJid) {
@@ -522,9 +647,10 @@ export default function (pi: ExtensionAPI) {
     });
 
     pi.on("message_end", async (event, ctx) => {
+        const { message } = event;
+        if (isMultiplexMode) return;
         if (sessionManager.getStatus() !== 'connected') return;
 
-        const { message } = event;
         // Only reply if it's the assistant and we have a valid target
         if (message.role === "assistant") {
             const lastJid = whatsappService.getLastRemoteJid();
@@ -561,7 +687,46 @@ export default function (pi: ExtensionAPI) {
         }
     });
 
+    pi.on("agent_end", async (event) => {
+        if (!isMultiplexMode || !activeDelivery || !activeDeliveryRunStarted) return;
+        const generated = event.messages as Array<{ role?: string; content?: Array<{ type?: string; text?: string }> }>;
+        const assistant = [...generated].reverse().find(message => message.role === 'assistant');
+        settledAssistantText = assistant?.content
+            ?.filter(content => content.type === 'text')
+            .map(content => content.text ?? '')
+            .join('\n') ?? '';
+    });
+
+    pi.on("agent_settled", async (_event, ctx) => {
+        agentRunning = false;
+        if (!isMultiplexMode) return;
+        if (!activeDelivery || !activeDeliveryRunStarted || !multiplexClient) {
+            activateNextDeliveryIfIdle();
+            return;
+        }
+        const delivery = activeDelivery;
+        try {
+            if (toolSentDeliveryId === delivery.deliveryId) {
+                toolSentDeliveryId = null;
+            } else if (settledAssistantText) {
+                await multiplexClient.reply(delivery.deliveryId, settledAssistantText);
+            } else {
+                await multiplexClient.complete(delivery.deliveryId);
+            }
+            advanceDelivery(delivery.deliveryId);
+        } catch {
+            // The router re-leases after a transport disconnect. Release only the
+            // stale local scope; never retry an outbound send with a new request ID.
+            advanceDelivery(delivery.deliveryId);
+            ctx.ui.notify('Multiplex reply outcome is unknown; it will not be blindly retried.', 'error');
+        }
+    });
+
     pi.on("session_shutdown", async () => {
+        if (isMultiplexMode) {
+            await multiplexClient?.stop();
+            return;
+        }
         logger.log("[WhatsApp-Pi] Session shutdown detected. Stopping WhatsApp service...");
         await whatsappService.stop();
     });

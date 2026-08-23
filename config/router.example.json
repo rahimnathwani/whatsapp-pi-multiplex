@@ -1,0 +1,14 @@
+{
+  "socketPath": "/run/whatsapp-pi/router.sock",
+  "socketMode": 432,
+  "socketGroup": "whatsapp-pi",
+  "stateDir": "/var/lib/whatsapp-pi-router",
+  "clients": [
+    { "id": "agent01", "tokenHash": "REPLACE_WITH_SHA256_HEX_OF_RANDOM_TOKEN" },
+    { "id": "agent02", "tokenHash": "REPLACE_WITH_SHA256_HEX_OF_RANDOM_TOKEN" }
+  ],
+  "routes": [
+    { "jid": "120363000000001@g.us", "clientId": "agent01" },
+    { "jid": "120363000000002@g.us", "clientId": "agent02" }
+  ]
+}

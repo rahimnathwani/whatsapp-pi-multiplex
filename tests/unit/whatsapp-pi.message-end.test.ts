@@ -52,6 +52,13 @@ const mocks = vi.hoisted(() => {
         recentsService: createRecentsService(),
         menuHandler: createMenuHandler(),
         incomingMediaService: createIncomingMediaService(),
+        multiplexClient: {
+            start: vi.fn().mockResolvedValue(undefined),
+            stop: vi.fn().mockResolvedValue(undefined),
+            onDelivery: vi.fn(),
+            reply: vi.fn().mockResolvedValue({ type: 'replyResult', requestId: 'r', deliveryId: 'd', status: 'sent' }),
+            complete: vi.fn().mockResolvedValue({ type: 'replyResult', requestId: 'r', deliveryId: 'd', status: 'completed' })
+        },
         extractIncomingText: vi.fn().mockReturnValue({ kind: 'text', text: 'hello from whatsapp' }),
         reset() {
             this.sessionManager = createSessionManager();
@@ -59,6 +66,13 @@ const mocks = vi.hoisted(() => {
             this.recentsService = createRecentsService();
             this.menuHandler = createMenuHandler();
             this.incomingMediaService = createIncomingMediaService();
+            this.multiplexClient = {
+                start: vi.fn().mockResolvedValue(undefined),
+                stop: vi.fn().mockResolvedValue(undefined),
+                onDelivery: vi.fn(),
+                reply: vi.fn().mockResolvedValue({ type: 'replyResult', requestId: 'r', deliveryId: 'd', status: 'sent' }),
+                complete: vi.fn().mockResolvedValue({ type: 'replyResult', requestId: 'r', deliveryId: 'd', status: 'completed' })
+            };
             this.extractIncomingText = vi.fn().mockReturnValue({ kind: 'text', text: 'hello from whatsapp' });
         }
     };
@@ -94,6 +108,10 @@ vi.mock('../../src/services/incoming-media.service.ts', () => ({
     IncomingMediaService: vi.fn(() => mocks.incomingMediaService)
 }));
 
+vi.mock('../../src/multiplex/client.ts', () => ({
+    MultiplexClient: vi.fn(() => mocks.multiplexClient)
+}));
+
 type PiHandler = (event: any, ctx: any) => Promise<void>;
 
 interface MockPi {
@@ -111,7 +129,7 @@ interface MockPi {
     sendUserMessage: ReturnType<typeof vi.fn>;
 }
 
-const createMockPi = (): MockPi => {
+const createMockPi = (multiplex = false): MockPi => {
     const flags = new Map<string, unknown>();
     const handlers = new Map<string, PiHandler>();
     const commands = new Map<string, any>();
@@ -126,7 +144,7 @@ const createMockPi = (): MockPi => {
         on: vi.fn((name: string, handler: PiHandler) => handlers.set(name, handler)),
         registerCommand: vi.fn((name: string, command: unknown) => commands.set(name, command)),
         registerTool: vi.fn((tool: { name: string }) => tools.set(tool.name, tool)),
-        getFlag: vi.fn().mockReturnValue(false),
+        getFlag: vi.fn((name: string) => name === 'whatsapp-multiplex-client' && multiplex ? 'agent-a' : false),
         appendEntry: vi.fn(),
         exec: vi.fn().mockResolvedValue({ code: 0 }),
         sendUserMessage: vi.fn()
@@ -286,5 +304,58 @@ describe('whatsapp-pi message_end handler', () => {
             '5511999998888@s.whatsapp.net',
             'Follow up'
         );
+    });
+
+    it('waits for an unrelated active run and finalizes the routed run only after agent_settled', async () => {
+        vi.stubEnv('WHATSAPP_PI_CREDENTIAL_FILE', '/private/token');
+        const registerExtension = await loadExtension();
+        const pi = createMockPi(true);
+        const ctx = createMockContext();
+        registerExtension(pi as any);
+        await pi.handlers.get('session_start')!({}, ctx);
+        const onDelivery = mocks.multiplexClient.onDelivery.mock.calls[0][0];
+
+        await pi.handlers.get('agent_start')!({}, ctx);
+        onDelivery({ deliveryId: 'd1', messageId: 'm1', routeJid: '12001@g.us', text: 'first', pushName: 'Alice' });
+        expect(pi.sendUserMessage).not.toHaveBeenCalled();
+        await pi.handlers.get('agent_end')!({ messages: [{ role: 'assistant', content: [{ type: 'text', text: 'unrelated' }] }] }, ctx);
+        expect(pi.sendUserMessage).not.toHaveBeenCalled();
+        await pi.handlers.get('agent_settled')!({}, ctx);
+        expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+        expect(mocks.multiplexClient.reply).not.toHaveBeenCalled();
+
+        await pi.handlers.get('agent_start')!({}, ctx);
+        await pi.handlers.get('message_end')!(makeAssistantEvent('routed reply'), ctx);
+        expect(mocks.multiplexClient.reply).not.toHaveBeenCalled();
+        await pi.handlers.get('agent_end')!({ messages: [makeAssistantEvent('routed reply').message] }, ctx);
+        expect(mocks.multiplexClient.reply).not.toHaveBeenCalled();
+        await pi.handlers.get('agent_settled')!({}, ctx);
+        expect(mocks.multiplexClient.reply).toHaveBeenCalledWith('d1', 'routed reply');
+    });
+
+    it('waits through tool execution, suppresses final text after a tool reply, and queues the successor delivery', async () => {
+        vi.stubEnv('WHATSAPP_PI_CREDENTIAL_FILE', '/private/token');
+        const registerExtension = await loadExtension();
+        const pi = createMockPi(true);
+        const ctx = createMockContext();
+        registerExtension(pi as any);
+        await pi.handlers.get('session_start')!({}, ctx);
+        const onDelivery = mocks.multiplexClient.onDelivery.mock.calls[0][0];
+        onDelivery({ deliveryId: 'd1', messageId: 'm1', routeJid: '12001@g.us', text: 'first', pushName: 'Alice' });
+        await pi.handlers.get('agent_start')!({}, ctx);
+        onDelivery({ deliveryId: 'd2', messageId: 'm2', routeJid: '12001@g.us', text: 'second', pushName: 'Alice' });
+
+        await pi.tools.get('send_wa_message').execute('tool', { message: 'tool reply' });
+        await pi.handlers.get('message_end')!({ message: { role: 'assistant', content: [{ type: 'toolCall', name: 'send_wa_message' }] } }, ctx);
+        expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+        await pi.handlers.get('agent_end')!({ messages: [{ role: 'assistant', content: [{ type: 'text', text: 'final confirmation' }] }] }, ctx);
+
+        expect(mocks.multiplexClient.reply).toHaveBeenCalledTimes(1);
+        expect(mocks.multiplexClient.reply).toHaveBeenCalledWith('d1', 'tool reply');
+        expect(mocks.multiplexClient.complete).not.toHaveBeenCalled();
+        expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+        await pi.handlers.get('agent_settled')!({}, ctx);
+        expect(pi.sendUserMessage).toHaveBeenCalledTimes(2);
+        expect(pi.sendUserMessage.mock.calls[1][0]).toContain('second');
     });
 });

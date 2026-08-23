@@ -1,20 +1,32 @@
 {
-  "name": "whatsapp-pi",
-  "version": "1.0.70",
+  "name": "whatsapp-pi-multiplex",
+  "version": "0.1.0",
   "type": "module",
-  "description": "WhatsApp integration extension for Pi",
+  "description": "Multiplex-capable WhatsApp integration extension for Pi (based on whatsapp-pi)",
   "main": "whatsapp-pi.ts",
+  "bin": {
+    "whatsapp-pi-multiplex": "dist/src/multiplex/router-main.js"
+  },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/RaphaCastelloes/whatsapp-pi.git"
+    "url": "git+https://github.com/rahimnathwani/whatsapp-pi-multiplex.git"
   },
   "bugs": {
-    "url": "https://github.com/RaphaCastelloes/whatsapp-pi/issues"
+    "url": "https://github.com/rahimnathwani/whatsapp-pi-multiplex/issues"
   },
-  "homepage": "https://github.com/RaphaCastelloes/whatsapp-pi#readme",
+  "homepage": "https://github.com/rahimnathwani/whatsapp-pi-multiplex#readme",
   "files": [
     "whatsapp-pi.ts",
-    "src"
+    "src",
+    "dist",
+    "config",
+    "scripts/setup-multiplex-users.sh",
+    "scripts/provision-multiplex-credential.py",
+    "scripts/whatsapp-pi-multiplex-client.sh",
+    "systemd/whatsapp-pi-router.service.in",
+    "systemd/whatsapp-pi-multiplex-client@.service.in",
+    "README.md",
+    "LICENSE"
   ],
   "keywords": [
     "pi",
@@ -24,12 +36,14 @@
     "baileys",
     "agent"
   ],
-  "author": "Rapha",
+  "author": "Rahim Nathwani (based on whatsapp-pi by Rapha Castelloes)",
   "license": "MIT",
   "scripts": {
     "lint": "eslint whatsapp-pi.ts \"src/**/*.ts\" \"tests/**/*.ts\"",
     "test": "vitest run",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "build:router": "tsc -p tsconfig.router.json",
+    "prepack": "npm run build:router"
   },
   "dependencies": {
     "@llamaindex/liteparse": "^1.5.3",
@@ -42,7 +56,8 @@
   },
   "devDependencies": {
     "@eslint/js": "^9.39.4",
-    "@mariozechner/pi-coding-agent": "latest",
+    "@earendil-works/pi-coding-agent": "latest",
+    "@earendil-works/pi-tui": "latest",
     "@types/node": "^20.11.0",
     "@types/qrcode-terminal": "^0.12.2",
     "@typescript-eslint/eslint-plugin": "^8.58.1",

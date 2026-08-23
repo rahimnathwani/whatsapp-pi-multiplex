@@ -112,6 +112,29 @@ describe('WhatsAppService Filtering', () => {
         expect(callback).not.toHaveBeenCalled();
     });
 
+    it('router ingress iterates every live upsert item and ignores history/from-self', async () => {
+        const callback = vi.fn();
+        whatsappService.setRouterMessageCallback(callback);
+        await sessionManager.setStatus('connected');
+
+        await whatsappService.handleIncomingMessages({
+            type: 'notify',
+            messages: [
+                { key: { id: 'one', remoteJid: '12001@g.us' }, message: { conversation: 'one' } },
+                { key: { id: 'self', remoteJid: '12001@g.us', fromMe: true }, message: { conversation: 'self' } },
+                { key: { id: 'two', remoteJid: '12002@g.us' }, message: { conversation: 'two' } }
+            ]
+        });
+        expect(callback).toHaveBeenCalledTimes(2);
+        expect(callback.mock.calls.map(call => call[0].message.key.id)).toEqual(['one', 'two']);
+
+        await whatsappService.handleIncomingMessages({
+            type: 'append',
+            messages: [{ key: { id: 'history', remoteJid: '12001@g.us' }, message: { conversation: 'history' } }]
+        });
+        expect(callback).toHaveBeenCalledTimes(2);
+    });
+
     describe('Group Binding', () => {
         it('should process group messages when bound to that group', async () => {
             const callback = vi.fn();

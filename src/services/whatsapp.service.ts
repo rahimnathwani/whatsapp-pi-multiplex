@@ -15,7 +15,7 @@ import { createStoragePaths } from './storage-path.js';
 import { extractIncomingText } from './incoming-message.resolver.js';
 import type { RecentsService } from './recents.service.js';
 
-const LOG_FILE = createStoragePaths().logPath;
+let LOG_FILE = createStoragePaths().logPath;
 function fileLog(msg: string) {
     try { appendFileSync(LOG_FILE, `[${new Date().toISOString()}] [WhatsApp-Pi] ${msg}\n`); } catch {
         // File logging is best-effort.
@@ -58,7 +58,7 @@ interface IncomingMessageWithContext {
     contextInfo?: IncomingMessageContextInfo;
 }
 
-interface IncomingMessageContent {
+export interface IncomingMessageContent {
     conversation?: string;
     extendedTextMessage?: {
         text?: string;
@@ -73,15 +73,21 @@ interface IncomingMessageContent {
     templateMessage?: IncomingMessageWithContext;
 }
 
-interface IncomingMessageLike {
+export interface IncomingMessageLike {
     key: IncomingMessageKey;
     message?: IncomingMessageContent;
     pushName?: string;
     messageTimestamp?: number | string;
 }
 
-interface MessagesUpsertEvent {
+export interface MessagesUpsertEvent {
     messages?: IncomingMessageLike[];
+    type?: string;
+}
+
+export interface RouterIncomingMessage {
+    accountId: string;
+    message: IncomingMessageLike;
 }
 
 interface WhatsAppSocketLike {
@@ -130,14 +136,18 @@ export class WhatsAppService {
     private intentionalStop = false;
     private onQRCode?: (qr: string) => void;
     private onMessage?: (m: MessagesUpsertEvent) => void;
+    private onRouterMessage?: (message: RouterIncomingMessage) => void | Promise<void>;
     private onStatusUpdate?: (status: string) => void;
+    private onConnectionReady?: (ready: boolean) => void;
     private lastRemoteJid: string | null = null;
     private qrWasShown = false;
     private boundGroupJid: string | null = null;
     private groupMetadataCache: Map<string, { id: string; subject: string; participants: Array<{ id: string }> }> = new Map();
+    private incomingProcessing: Promise<void> = Promise.resolve();
 
-    constructor(sessionManager: SessionManager) {
+    constructor(sessionManager: SessionManager, storageRoot?: string) {
         this.sessionManager = sessionManager;
+        if (storageRoot) LOG_FILE = createStoragePaths(storageRoot, storageRoot).logPath;
         this.messageSender = new MessageSender(this);
     }
 
@@ -321,6 +331,7 @@ export class WhatsAppService {
 
     private cleanupSocket() {
         this.clearReconnectTimeout();
+        this.onConnectionReady?.(false);
 
         if (!this.socket) {
             return;
@@ -356,7 +367,12 @@ export class WhatsAppService {
         });
 
         socket.ev.on('messages.upsert', (payload) => {
-            void this.handleIncomingMessages(payload);
+            this.incomingProcessing = this.incomingProcessing
+                .then(() => this.handleIncomingMessages(payload))
+                .catch(error => {
+                    fileLog(`[messages.upsert] ingestion failed: ${error instanceof Error ? error.message : String(error)}`);
+                    if (this.verboseMode) console.error('[WhatsApp-Pi] Failed to ingest WhatsApp upsert', error);
+                });
         });
     }
 
@@ -488,6 +504,7 @@ export class WhatsAppService {
         await this.saveCreds?.();
         await this.sessionManager.markAuthStateAvailable();
         await this.sessionManager.setStatus('connected');
+        this.onConnectionReady?.(true);
         this.onStatusUpdate?.(t('service.whatsapp.connected'));
 
         if (this.qrWasShown) {
@@ -664,60 +681,55 @@ export class WhatsAppService {
 
     public async handleIncomingMessages(payload: MessagesUpsertEvent) {
         if (this.sessionManager.getStatus() !== 'connected') return;
+        // Baileys marks live ingress as "notify". A multiplex router must never
+        // prompt from history/backfill ("append"), while legacy tests/callers may omit it.
+        if (this.onRouterMessage && payload.type !== 'notify') return;
 
-        const message = payload.messages?.[0];
-        if (!message || !message.key.remoteJid) return;
+        for (const message of payload.messages ?? []) {
+            if (!message?.key.remoteJid) continue;
+            if (this.onRouterMessage && message.key.fromMe) continue;
 
-        const text = this.extractText(message.message);
-        if (this.isPiGeneratedMessage(text)) return;
+            const text = this.extractText(message.message);
+            if (this.isPiGeneratedMessage(text)) continue;
 
-        const remoteJid = message.key.remoteJid;
-        const isGroup = remoteJid.endsWith('@g.us');
+            const remoteJid = message.key.remoteJid;
+            const isGroup = remoteJid.endsWith('@g.us');
+            if (isGroup) void this.prepareGroupSession(remoteJid);
 
-        if (this.boundGroupJid) {
-            // Group-only mode narrows the source before allow-list checks run.
-            if (remoteJid !== this.boundGroupJid) return;
-        }
-
-        // Eagerly cache group metadata on incoming messages so it's
-        // available for sender-key encryption when we reply
-        if (isGroup) {
-            void this.prepareGroupSession(remoteJid);
-        }
-
-        const senderJid = isGroup
-            ? remoteJid
-            : this.normalizeContactNumber(remoteJid.split('@')[0]);
-        
-        // Process the message with full context (including reaction lookup)
-        const resolved = extractIncomingText(message.message, this.recentsService);
-        const displayText = resolved.text;
-        
-        void this.recordIncomingMessage(message, remoteJid, displayText);
-
-        const pushName = message.pushName || undefined;
-
-        if (this.boundGroupJid) {
-            if (!this.sessionManager.isAllowedGroup(this.boundGroupJid)) {
-                await this.sessionManager.trackIgnoredNumber(this.boundGroupJid, pushName);
-                return;
+            if (this.onRouterMessage) {
+                const resolved = extractIncomingText(message.message, this.recentsService);
+                void this.recordIncomingMessage(message, remoteJid, resolved.text);
+                await this.onRouterMessage({
+                    accountId: this.normalizeJidForComparison(this.socket?.user?.id ?? 'unknown'),
+                    message
+                });
+                continue;
             }
 
+            if (this.boundGroupJid && remoteJid !== this.boundGroupJid) continue;
+            const senderJid = isGroup ? remoteJid : this.normalizeContactNumber(remoteJid.split('@')[0]);
+            const resolved = extractIncomingText(message.message, this.recentsService);
+            void this.recordIncomingMessage(message, remoteJid, resolved.text);
+            const pushName = message.pushName || undefined;
+
+            if (this.boundGroupJid) {
+                if (!this.sessionManager.isAllowedGroup(this.boundGroupJid)) {
+                    await this.sessionManager.trackIgnoredNumber(this.boundGroupJid, pushName);
+                    continue;
+                }
+                this.lastRemoteJid = remoteJid;
+                this.onMessage?.({ ...payload, messages: [message] });
+                continue;
+            }
+
+            if (!this.sessionManager.isConversationAllowed(senderJid)) {
+                if (this.isVerbose()) console.log(t('service.whatsapp.ignoredNotAllowed', { senderJid }));
+                await this.sessionManager.trackIgnoredNumber(senderJid, pushName);
+                continue;
+            }
             this.lastRemoteJid = remoteJid;
-            this.onMessage?.(payload);
-            return;
+            this.onMessage?.({ ...payload, messages: [message] });
         }
-
-        if (!this.sessionManager.isConversationAllowed(senderJid)) {
-            if (this.isVerbose()) {
-                console.log(t('service.whatsapp.ignoredNotAllowed', { senderJid }));
-            }
-            await this.sessionManager.trackIgnoredNumber(senderJid, pushName);
-            return;
-        }
-
-        this.lastRemoteJid = remoteJid;
-        this.onMessage?.(payload);
     }
 
     setQRCodeCallback(callback: (qr: string) => void) {
@@ -728,8 +740,16 @@ export class WhatsAppService {
         this.onMessage = callback;
     }
 
+    setRouterMessageCallback(callback: (message: RouterIncomingMessage) => void | Promise<void>) {
+        this.onRouterMessage = callback;
+    }
+
     setStatusCallback(callback: (status: string) => void) {
         this.onStatusUpdate = callback;
+    }
+
+    setConnectionReadyCallback(callback: (ready: boolean) => void) {
+        this.onConnectionReady = callback;
     }
 
     public getLastRemoteJid(): string | null {
@@ -764,6 +784,22 @@ export class WhatsAppService {
             fileLog(`Cached group metadata for ${jid} (${metadata.participants?.length ?? 0} participants)`);
         } catch (error) {
             fileLog(`FAILED to fetch group metadata for ${jid}: ${error instanceof Error ? error.message : String(error)}`);
+        }
+    }
+
+    async sendMessageOnce(jid: string, text: string) {
+        const recipientJid = this.resolveOutboundRecipientJid(jid);
+        const socket = this.getActiveSocket();
+        if (!socket) return { success: false, error: t('service.whatsapp.notConnected'), attempts: 0 };
+        await this.sendPresence(recipientJid, 'composing');
+        try {
+            const response = await socket.sendMessage(recipientJid, { text });
+            await this.sendPresence(recipientJid, 'paused');
+            return { success: true, messageId: response?.key?.id, attempts: 1 };
+        } catch (error) {
+            await this.sendPresence(recipientJid, 'paused');
+            // The caller must treat this as ambiguous: the remote may have accepted it.
+            throw error;
         }
     }
 

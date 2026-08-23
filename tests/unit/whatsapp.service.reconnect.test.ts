@@ -137,6 +137,26 @@ describe('WhatsAppService reconnect behaviour', () => {
         await service.stop();
     });
 
+    it('serializes overlapping router upserts and continues after an ingestion failure', async () => {
+        const { WhatsAppService } = await import('../../src/services/whatsapp.service.ts');
+        const sessionManager = createSessionManager();
+        const service = new WhatsAppService(sessionManager as any);
+        let rejectFirst!: (error: Error) => void;
+        const ingestion = vi.spyOn(service, 'handleIncomingMessages')
+            .mockImplementationOnce(() => new Promise<void>((_resolve, reject) => { rejectFirst = reject; }))
+            .mockResolvedValue(undefined);
+        await service.start();
+        const upsert = baileysMocks.sockets[0].handlers.get('messages.upsert')!;
+
+        void upsert({ type: 'notify', messages: [{ key: { id: 'one', remoteJid: '12001@g.us' }, message: { conversation: 'one' } }] });
+        void upsert({ type: 'notify', messages: [{ key: { id: 'two', remoteJid: '12001@g.us' }, message: { conversation: 'two' } }] });
+        await vi.waitFor(() => expect(ingestion).toHaveBeenCalledTimes(1));
+        rejectFirst(new Error('media failure'));
+        await vi.waitFor(() => expect(ingestion).toHaveBeenCalledTimes(2));
+        expect(ingestion.mock.calls.map(call => call[0].messages?.[0].key.id)).toEqual(['one', 'two']);
+        await service.stop();
+    });
+
     it('logout() prevents auto-reconnect', async () => {
         vi.useFakeTimers();
         const { WhatsAppService } = await import('../../src/services/whatsapp.service.ts');

@@ -2,8 +2,10 @@
   <img src="https://upload.wikimedia.org/wikipedia/commons/6/6b/WhatsApp.svg" alt="WhatsApp Logo" width="100">
 </p>
 
-# WhatsApp-Pi
-[![GitHub](https://img.shields.io/badge/github-repo-black.svg?style=flat-square&logo=github)](https://github.com/RaphaCastelloes/whatsapp-pi)
+# whatsapp-pi-multiplex
+[![Upstream](https://img.shields.io/badge/upstream-whatsapp--pi-black.svg?style=flat-square&logo=github)](https://github.com/RaphaCastelloes/whatsapp-pi)
+
+A multiplex-capable fork of **whatsapp-pi**, retaining Rapha Castelloes' upstream MIT attribution. Standalone mode remains the default and is backward-compatible.
 
 A WhatsApp integration extension for the **[Pi Coding Agent](https://pi.dev)**. 
 
@@ -84,7 +86,7 @@ If a PDF cannot be parsed automatically, it is still saved and forwarded with a 
 
 1. Install the extension:
 ```bash
-pi install npm:whatsapp-pi
+pi install npm:whatsapp-pi-multiplex
 ```
 
 2. Start Pi:
@@ -122,14 +124,93 @@ systemctl --user status whatsapp-pi.service
 systemctl --user disable --now whatsapp-pi.service
 ```
 
+## Multiplex Router (Linux)
+
+Multiplex mode runs exactly one Baileys connection in a dedicated router account and routes up to 20 exact chat JIDs to separate Pi Unix users. It is opt-in; all commands above continue to use standalone mode.
+
+### Build and provision (Debian/Ubuntu or Arch)
+
+Install Node.js 20+, build, and expose the daemon command. Keep the checkout/package in a root-owned location such as `/opt/whatsapp-pi-multiplex`; agent users must not have write permission to the extension code, systemd units, or router configuration.
+
+```bash
+npm install
+npm run build:router
+sudo npm link
+sudo ./scripts/setup-multiplex-users.sh agent01 agent02 # ... up to agent20
+sudo cp config/router.example.json /etc/whatsapp-pi-router/config.json
+```
+
+The setup script prints each client's SHA-256 token hash. Put those hashes and exact `@g.us`/`@s.whatsapp.net` routes in the router config. Keep the config router-only:
+
+```bash
+sudo chown whatsapp-router:whatsapp-pi /etc/whatsapp-pi-router/config.json
+sudo chmod 0600 /etc/whatsapp-pi-router/config.json
+sudo cp systemd/whatsapp-pi-router.service.in /etc/systemd/system/whatsapp-pi-router.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now whatsapp-pi-router
+```
+
+The QR is printed in the router journal/terminal on first pairing. Treat journal access as privileged because pairing QR codes and route metadata are sensitive; prefer running the daemon in a protected terminal for first pairing and restrict persistent journal access. Send `SIGUSR1` to log status (WhatsApp connection, route count, connected clients, and queue depth):
+
+```bash
+sudo -u whatsapp-router WHATSAPP_PI_ROUTER_CONFIG=/etc/whatsapp-pi-router/config.json whatsapp-pi-multiplex
+sudo systemctl kill -s SIGUSR1 whatsapp-pi-router
+```
+
+Start each Pi client as its own user. Tokens are read only from per-user mode-`0600` files, never command-line arguments:
+
+```bash
+sudo -iu agent01 sh -lc 'env \
+  WHATSAPP_PI_ROUTER_SOCKET=/run/whatsapp-pi/router.sock \
+  WHATSAPP_PI_CREDENTIAL_FILE="$HOME/.config/whatsapp-pi-multiplex/token" \
+  pi -e /path/to/whatsapp-pi.ts --whatsapp-multiplex-client=agent01'
+```
+
+For systemd-managed clients (one isolated service/tmux per Unix user), instantiate the included template after replacing its two build-time paths:
+
+```bash
+project=$(pwd)
+pi_bin=$(command -v pi)
+sed -e "s|__PROJECT_DIR__|$project|g" -e "s|__PI_BIN__|$pi_bin|g" \
+  systemd/whatsapp-pi-multiplex-client@.service.in | \
+  sudo tee /etc/systemd/system/whatsapp-pi-multiplex-client@.service >/dev/null
+sudo systemctl daemon-reload
+sudo systemctl enable --now whatsapp-pi-multiplex-client@agent01
+# Repeat through agent20 as provisioned; inspect one TUI with:
+sudo -iu agent01 tmux attach -t whatsapp-pi-agent01
+```
+
+`whatsapp-pi` socket-group membership permits connection but not route claims. The router authenticates the client token and derives the outbound JID exclusively from its persisted delivery lease. A second live connection for a client is rejected. Router state stays mode `0700`; agent homes/credential directories are mode `0700` and tokens mode `0600`.
+
+### v1 semantics and limits
+
+- Exact static routes only; no wildcard or default route. One in-flight delivery per route, with concurrency across routes.
+- Live Baileys `notify` upserts are iterated and durably deduplicated before dispatch. Offline clients receive queued messages after reconnect/restart.
+- Delivery to Pi is **at least once**, not exactly once. The router persists a `sending` boundary before calling WhatsApp; a daemon crash at that boundary is recovered as terminally ambiguous and is not redelivered. WhatsApp itself still cannot provide a transactional exactly-once guarantee.
+- IPC is protocol v1 strict NDJSON. Client frames are capped at 272 KiB (4 KiB before authentication), text at 256 KiB, and inline images at 5 MiB. Connections, frames per read, and control-frame rate are bounded. Audio, video, and documents are placeholders in v1; daemon filesystem paths are never sent.
+- Client mode disables `/whatsapp` connection/config ownership, reactions, and arbitrary-JID outbound sends. Replies are scoped to the immutable active delivery ID.
+- The compact JSON inbox is intended for the bounded 20-route/low-volume v1. It allows at most 100 active records per route, 1,000 active records globally, and 100 MiB of retained payloads. Completed payloads are reduced to tombstones; tombstones expire after 7 days and are capped at 10,000. It is atomically replaced and fsynced, but SQLite may be preferable for sustained high volume.
+- An active lease has no daemon-side turn timeout in v1. A wedged client must disconnect/restart so the router requeues that delivery.
+- Unix socket permissions and systemd hardening are Linux-oriented. Cross-UID isolation must be validated on the target host.
+
+### Multiplex test quickstart
+
+```bash
+npm test
+npm run lint
+npm run typecheck
+npm run build:router
+npm pack --dry-run
+```
+
 ## Development / Testing
 
-If you are developing or testing the extension locally, you can clone the repository from [GitHub](https://github.com/RaphaCastelloes/whatsapp-pi):
+If you are developing or testing the extension locally, clone [whatsapp-pi-multiplex](https://github.com/rahimnathwani/whatsapp-pi-multiplex):
 
 1. Clone and install dependencies:
 ```bash
-git clone https://github.com/RaphaCastelloes/whatsapp-pi.git
-cd whatsapp-pi
+git clone https://github.com/rahimnathwani/whatsapp-pi-multiplex.git
+cd whatsapp-pi-multiplex
 npm install
 ```
 

@@ -1,0 +1,26 @@
+[Unit]
+Description=whatsapp-pi-multiplex client %i (tmux)
+Wants=network-online.target whatsapp-pi-router.service
+After=network-online.target whatsapp-pi-router.service
+
+[Service]
+Type=simple
+User=%i
+SupplementaryGroups=whatsapp-pi
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PI_COMMAND=__PI_BIN__
+Environment=PI_ENTRYPOINT=__PROJECT_DIR__/whatsapp-pi.ts
+Environment=WHATSAPP_PI_CLIENT_ID=%i
+Environment=WHATSAPP_PI_ROUTER_SOCKET=/run/whatsapp-pi/router.sock
+Environment=WHATSAPP_PI_CREDENTIAL_FILE=%h/.config/whatsapp-pi-multiplex/token
+Environment=WHATSAPP_PI_WORKING_DIRECTORY=%h
+WorkingDirectory=%h
+ExecStart=__PROJECT_DIR__/scripts/whatsapp-pi-multiplex-client.sh
+ExecStop=/usr/bin/tmux kill-session -t whatsapp-pi-%i
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
