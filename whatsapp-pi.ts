@@ -11,7 +11,10 @@ import { WhatsAppPiLogger } from './src/services/whatsapp-pi.logger.js';
 import { ReactionSender } from './src/services/reaction.sender.js';
 import { initI18n, t } from './src/i18n.js';
 import { MultiplexClient } from './src/multiplex/client.js';
-import type { DeliveryPayload } from './src/multiplex/protocol.js';
+import { isValidClientId, type DeliveryPayload } from './src/multiplex/protocol.js';
+import { createStoragePaths } from './src/services/storage-path.js';
+import { rm } from 'node:fs/promises';
+import { join } from 'node:path';
 
 const shutdownState = globalThis as typeof globalThis & {
     __whatsappPiShutdown?: {
@@ -50,11 +53,13 @@ export default function (pi: ExtensionAPI) {
 
     const multiplexFlag = pi.getFlag("whatsapp-multiplex-client");
     const multiplexClientId = typeof multiplexFlag === 'string' ? multiplexFlag : '';
+    if (multiplexClientId && !isValidClientId(multiplexClientId)) throw new Error('invalid multiplex client ID');
     const isMultiplexMode = multiplexClientId.length > 0;
     const multiplexClient = isMultiplexMode ? new MultiplexClient({
         clientId: multiplexClientId,
         socketPath: process.env.WHATSAPP_PI_ROUTER_SOCKET || '/run/whatsapp-pi/router.sock',
-        credentialFile: process.env.WHATSAPP_PI_CREDENTIAL_FILE || ''
+        credentialFile: process.env.WHATSAPP_PI_CREDENTIAL_FILE || '',
+        mediaDirectory: join(createStoragePaths().mediaDir, 'multiplex', multiplexClientId)
     }) : undefined;
     let activeDelivery: DeliveryPayload | null = null;
     const pendingDeliveries: DeliveryPayload[] = [];
@@ -62,6 +67,7 @@ export default function (pi: ExtensionAPI) {
     let agentRunning = false;
     let activeDeliveryRunStarted = false;
     let settledAssistantText = '';
+    let deliveryPreparing = false;
 
     const sessionManager = new SessionManager();
     const whatsappService = new WhatsAppService(sessionManager);
@@ -332,7 +338,7 @@ export default function (pi: ExtensionAPI) {
         
     });
 
-    const activateDelivery = (delivery: DeliveryPayload) => {
+    const activatePreparedDelivery = (delivery: DeliveryPayload) => {
         activeDelivery = delivery;
         activeDeliveryRunStarted = false;
         settledAssistantText = '';
@@ -351,10 +357,46 @@ export default function (pi: ExtensionAPI) {
         }
     };
 
+    const prepareDelivery = async (delivery: DeliveryPayload): Promise<DeliveryPayload> => {
+        if (!delivery.media || !multiplexClient) return delivery;
+        try {
+            const local = await multiplexClient.fetchMedia(delivery);
+            if (!local) return delivery;
+            if (local.kind === 'audio') {
+                let transcription: string;
+                try { transcription = await audioService.transcribeFile(local.path); }
+                finally { await rm(local.path, { force: true }).catch(() => undefined); }
+                return { ...delivery, media: undefined, text: t('incoming.media.audioTranscribed', { transcription }) };
+            }
+            const processed = await incomingMediaService.processLocalDocument(local.path, {
+                fileName: local.fileName,
+                mimeType: local.mimeType,
+                size: local.size,
+                caption: delivery.text
+            });
+            return { ...delivery, media: undefined, text: processed.text };
+        } catch (error) {
+            logger.error('[WhatsApp-Pi] Multiplex media preparation failed:', error);
+            const fallback = delivery.media.kind === 'audio'
+                ? '[Audio message could not be prepared]'
+                : `[Document ${delivery.media.fileName || 'attachment'} could not be prepared]`;
+            return { ...delivery, media: undefined, text: fallback };
+        }
+    };
+
     const activateNextDeliveryIfIdle = () => {
-        if (agentRunning || activeDelivery) return;
+        if (agentRunning || activeDelivery || deliveryPreparing) return;
         const next = pendingDeliveries.shift();
-        if (next) activateDelivery(next);
+        if (!next) return;
+        if (!next.media) { activatePreparedDelivery(next); return; }
+        deliveryPreparing = true;
+        void prepareDelivery(next)
+            .then(activatePreparedDelivery)
+            .catch(error => logger.error('[WhatsApp-Pi] Delivery activation failed:', error))
+            .finally(() => {
+                deliveryPreparing = false;
+                if (!activeDelivery) activateNextDeliveryIfIdle();
+            });
     };
 
     const advanceDelivery = (deliveryId: string) => {
@@ -368,9 +410,9 @@ export default function (pi: ExtensionAPI) {
     if (multiplexClient) {
         multiplexClient.onDelivery((delivery) => {
             // Pi queues follow-ups behind an existing run. Do not assign a reply
-            // scope until that unrelated run has fully ended.
-            if (agentRunning || activeDelivery) pendingDeliveries.push(delivery);
-            else activateDelivery(delivery);
+            // scope until that unrelated run and media preparation have ended.
+            pendingDeliveries.push(delivery);
+            activateNextDeliveryIfIdle();
         });
     }
 

@@ -2,7 +2,7 @@ import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { NdjsonDecoder, encodeFrame, validateClientFrame, validateServerFrame } from '../../src/multiplex/protocol.js';
+import { MAX_MEDIA_CHUNK_BYTES, NdjsonDecoder, encodeFrame, validateClientFrame, validateServerFrame } from '../../src/multiplex/protocol.js';
 import { authenticateToken, hashToken, loadRouterConfig, normalizeRouteJid, parseRouterConfig } from '../../src/multiplex/router-config.js';
 
 const configValue = () => ({
@@ -32,7 +32,10 @@ describe('multiplex protocol', () => {
     it('rejects malformed, unknown, version-mismatched, and oversized frames', () => {
         expect(() => new NdjsonDecoder(validateClientFrame).push('{nope}\n')).toThrow('malformed JSON');
         expect(() => validateClientFrame({ type: 'ping', requestId: 'x', jid: 'attacker@g.us' })).toThrow();
-        expect(() => validateClientFrame({ type: 'hello', protocol: 2, clientId: 'a', token: 'x' })).toThrow();
+        expect(() => validateClientFrame({ type: 'hello', protocol: 1, clientId: 'a', token: 'x' })).toThrow();
+        for (const clientId of ['.', '..', 'agent/a', 'agent\\a']) {
+            expect(() => validateClientFrame({ type: 'hello', protocol: 2, clientId, token: 'x'.repeat(32) })).toThrow('invalid hello');
+        }
         expect(() => new NdjsonDecoder(validateClientFrame, 8).push('123456789')).toThrow('frame too large');
         expect(() => new NdjsonDecoder(validateClientFrame, 1024, 2).push(
             '{"type":"ping","requestId":"1"}\n{"type":"ping","requestId":"2"}\n{"type":"ping","requestId":"3"}\n'
@@ -45,6 +48,20 @@ describe('multiplex protocol', () => {
             type: 'delivery', deliveryId: 'd', messageId: 'm', routeJid: '12001@g.us', text: 'x', pushName: 'Alice',
             image: { mimeType: 'image/jpeg', data: 'not-base64' }
         })).toThrow('invalid inline image');
+    });
+
+    it('strictly validates bounded opaque media frames and descriptors', () => {
+        const handle = 'A'.repeat(43);
+        const sha256 = 'a'.repeat(64);
+        expect(validateClientFrame({ type: 'mediaRead', requestId: 'r', deliveryId: 'd', handle, offset: 0, length: MAX_MEDIA_CHUNK_BYTES })).toMatchObject({ type: 'mediaRead' });
+        expect(validateClientFrame({ type: 'mediaRelease', requestId: 'r', deliveryId: 'd', handle })).toMatchObject({ type: 'mediaRelease' });
+        expect(validateServerFrame({ type: 'delivery', deliveryId: 'd', messageId: 'm', routeJid: '12001@g.us', text: 'doc', pushName: 'Alice', media: { handle, kind: 'document', mimeType: 'application/pdf', fileName: '../unsafe.pdf', size: 3, sha256 } })).toMatchObject({ type: 'delivery' });
+        expect(validateServerFrame({ type: 'mediaChunk', requestId: 'r', deliveryId: 'd', handle, offset: 0, data: Buffer.from('abc').toString('base64'), eof: true })).toMatchObject({ type: 'mediaChunk' });
+        expect(() => validateClientFrame({ type: 'mediaRead', requestId: 'r', deliveryId: 'd', handle, offset: -1, length: 1 })).toThrow();
+        expect(() => validateClientFrame({ type: 'mediaRead', requestId: 'r', deliveryId: 'd', handle, offset: 0, length: MAX_MEDIA_CHUNK_BYTES + 1 })).toThrow();
+        expect(() => validateClientFrame({ type: 'mediaRelease', requestId: 'r', deliveryId: 'd', handle, path: '/router/private' })).toThrow();
+        expect(() => validateServerFrame({ type: 'mediaChunk', requestId: 'r', deliveryId: 'd', handle, offset: 0, data: 'noncanonical=', eof: true })).toThrow();
+        expect(() => validateServerFrame({ type: 'delivery', deliveryId: 'd', messageId: 'm', routeJid: '12001@g.us', text: 'doc', pushName: 'Alice', media: { handle: 'short', kind: 'document', mimeType: 'bad mime', size: 3, sha256: 'bad' } })).toThrow();
     });
 });
 
@@ -71,6 +88,11 @@ describe('router config and authentication', () => {
         const tooMany = configValue();
         tooMany.clients = Array.from({ length: 21 }, (_, index) => ({ id: `a${index}`, tokenHash: hashToken(`${index}`) }));
         expect(() => parseRouterConfig(tooMany)).toThrow('1 to 20 clients');
+        for (const id of ['.', '..', 'agent/a', 'agent\\a']) {
+            const unsafe = configValue();
+            unsafe.clients[0].id = id;
+            expect(() => parseRouterConfig(unsafe)).toThrow('invalid client');
+        }
     });
 
     it('rejects insecure socket modes and explicitly malformed privileged path fields', () => {

@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { mkdir, open, readFile, rename, rm } from 'node:fs/promises';
 import { dirname } from 'node:path';
-import type { DeliveryPayload } from './protocol.js';
+import { MAX_TEXT_BYTES, type DeliveryPayload } from './protocol.js';
 
 export type InboxState = 'queued' | 'inflight' | 'sending' | 'completed';
 export interface PersistedResult {
@@ -71,10 +71,32 @@ export class DurableInbox {
         }
     }
 
-    private key(accountId: string, routeJid: string, messageId: string) { return `${accountId}\u0000${routeJid}\u0000${messageId}`; }
+    keyFor(accountId: string, routeJid: string, messageId: string) { return `${accountId}\u0000${routeJid}\u0000${messageId}`; }
 
     has(accountId: string, routeJid: string, messageId: string): boolean {
-        return this.records.has(this.key(accountId, routeJid, messageId));
+        return this.records.has(this.keyFor(accountId, routeJid, messageId));
+    }
+
+    activeMediaHandles(): Set<string> {
+        return new Set(this.list().flatMap(record => record.state !== 'completed' && record.payload?.media ? [record.payload.media.handle] : []));
+    }
+
+    async replaceMissingMedia(handles: ReadonlySet<string>): Promise<void> {
+        if (!handles.size) return;
+        await this.mutate(async () => {
+            let changed = false;
+            for (const record of this.records.values()) {
+                if (!record.payload?.media || !handles.has(record.payload.media.handle)) continue;
+                const fallback = '\n\n[Attached media is unavailable after router recovery]';
+                const bytes = Buffer.from(`${record.payload.text}${fallback}`, 'utf8');
+                record.payload.text = bytes.length <= MAX_TEXT_BYTES
+                    ? bytes.toString('utf8')
+                    : bytes.subarray(0, MAX_TEXT_BYTES).toString('utf8').replace(/\uFFFD$/u, '');
+                delete record.payload.media;
+                changed = true;
+            }
+            if (changed) await this.persist();
+        });
     }
 
     canAccept(routeJid: string, payloadBytes = 0): boolean {
@@ -87,7 +109,7 @@ export class DurableInbox {
     async enqueue(input: Omit<InboxRecord, 'key' | 'state' | 'attempts' | 'createdAt' | 'deliveryId' | 'completedAt'> & { payload: Omit<DeliveryPayload, 'deliveryId'> }): Promise<{ record: InboxRecord; inserted: boolean }> {
         return this.mutate(async () => {
             this.compact();
-            const key = this.key(input.accountId, input.routeJid, input.messageId);
+            const key = this.keyFor(input.accountId, input.routeJid, input.messageId);
             const existing = this.records.get(key);
             if (existing) return { record: existing, inserted: false };
             const payloadBytes = Buffer.byteLength(JSON.stringify(input.payload));

@@ -13,7 +13,8 @@ import { WhatsAppService, type RouterIncomingMessage } from '../services/whatsap
 import { DurableInbox } from './durable-inbox.js';
 import { authenticateToken, normalizeRouteJid, type RouterConfig } from './router-config.js';
 import { RouteScheduler } from './route-scheduler.js';
-import { MAX_CLIENT_FRAME_BYTES, MAX_FRAMES_PER_READ, MAX_IMAGE_BYTES, MAX_PREAUTH_FRAME_BYTES, MAX_TEXT_BYTES, NdjsonDecoder, PROTOCOL_VERSION, encodeFrame, validateClientFrame, type ClientFrame, type InlineImage, type ServerFrame } from './protocol.js';
+import { DurableMediaSpool } from './media-spool.js';
+import { MAX_CLIENT_FRAME_BYTES, MAX_FRAMES_PER_READ, MAX_IMAGE_BYTES, MAX_MEDIA_FILE_BYTES, MAX_PREAUTH_FRAME_BYTES, MAX_TEXT_BYTES, NdjsonDecoder, PROTOCOL_VERSION, encodeFrame, validateClientFrame, type ClientFrame, type InlineImage, type MediaHandle, type ServerFrame } from './protocol.js';
 
 const execFileAsync = promisify(execFile);
 interface Connection {
@@ -24,6 +25,7 @@ interface Connection {
     authenticationTimeout: ReturnType<typeof setTimeout>;
     processing: Promise<void>;
     lastPingAt: number;
+    mediaProgress: Map<string, { deliveryId: string; offset: number; completed: boolean }>;
 }
 
 const MAX_CONNECTIONS = 64;
@@ -34,12 +36,14 @@ export class RouterServer {
     private readonly whatsapp: WhatsAppService;
     private readonly recents: RecentsService;
     private readonly inbox: DurableInbox;
+    private readonly mediaSpool: DurableMediaSpool;
     private readonly scheduler: RouteScheduler;
     private readonly connections = new Set<Connection>();
     private readonly readinessWaiters = new Set<{ generation: number; resolve: () => void }>();
     private whatsappReady = false;
     private readinessGeneration = 0;
     private server?: Server;
+    private mediaGcTimer?: ReturnType<typeof setInterval>;
 
     constructor(private readonly config: RouterConfig) {
         this.sessionManager = new SessionManager(config.stateDir, config.stateDir);
@@ -47,10 +51,13 @@ export class RouterServer {
         this.recents = new RecentsService(this.sessionManager, config.stateDir);
         this.whatsapp.setRecentsService(this.recents);
         this.inbox = new DurableInbox(join(config.stateDir, 'inbox.json'));
+        this.mediaSpool = new DurableMediaSpool(join(config.stateDir, 'media-spool'));
         this.scheduler = new RouteScheduler(this.inbox, {
             isReady: () => this.whatsappReady,
             waitUntilReady: requireReconnect => this.waitUntilWhatsAppReady(requireReconnect),
             send: (jid, text) => this.sendOutbound(jid, text)
+        }, {
+            onFinished: async (_record, mediaHandle) => { if (mediaHandle) await this.mediaSpool.release(mediaHandle); }
         });
     }
 
@@ -60,6 +67,8 @@ export class RouterServer {
         await this.sessionManager.ensureInitialized();
         await this.recents.ensureInitialized();
         await this.inbox.initialize();
+        await this.mediaSpool.initialize();
+        await this.reconcileMedia();
         await mkdir(dirname(this.config.socketPath), { recursive: true, mode: 0o750 });
         await rm(this.config.socketPath, { force: true });
         this.server = createServer(socket => this.accept(socket));
@@ -92,9 +101,13 @@ export class RouterServer {
         }));
         this.whatsapp.setRouterMessageCallback(message => this.ingest(message));
         await this.whatsapp.start();
+        this.mediaGcTimer = setInterval(() => { void this.reconcileMedia().catch(error => console.warn('[router] media spool GC failed', error)); }, 60 * 60 * 1_000);
+        this.mediaGcTimer.unref();
     }
 
     async stop(): Promise<void> {
+        if (this.mediaGcTimer) clearInterval(this.mediaGcTimer);
+        this.mediaGcTimer = undefined;
         for (const connection of this.connections) connection.socket.destroy();
         await new Promise<void>(resolve => this.server ? this.server.close(() => resolve()) : resolve());
         await this.whatsapp.stop();
@@ -126,7 +139,8 @@ export class RouterServer {
             authenticated: false,
             authenticationTimeout: setTimeout(() => socket.destroy(), 5000),
             processing: Promise.resolve(),
-            lastPingAt: 0
+            lastPingAt: 0,
+            mediaProgress: new Map()
         };
         this.connections.add(connection);
         socket.on('data', chunk => {
@@ -179,12 +193,44 @@ export class RouterServer {
             return;
         }
         try {
+            if (frame.type === 'mediaRead' || frame.type === 'mediaRelease') {
+                const inboxRecord = this.scheduler.authorizeMedia(connection.clientId!, frame.deliveryId, frame.handle);
+                const spoolRecord = this.mediaSpool.get(frame.handle);
+                if (!spoolRecord || spoolRecord.clientId !== connection.clientId || spoolRecord.inboxKey !== inboxRecord.key ||
+                    spoolRecord.accountId !== inboxRecord.accountId || spoolRecord.routeJid !== inboxRecord.routeJid || spoolRecord.messageId !== inboxRecord.messageId) {
+                    throw new Error('media is not owned by this active delivery');
+                }
+                if (frame.type === 'mediaRead') {
+                    const progress = connection.mediaProgress.get(frame.handle);
+                    const expectedOffset = progress?.deliveryId === frame.deliveryId ? progress.offset : 0;
+                    if (progress?.deliveryId === frame.deliveryId && progress.completed) throw new Error('media transfer is already complete');
+                    if (frame.offset !== expectedOffset) throw new Error('media reads must be sequential');
+                    const chunk = await this.mediaSpool.read(frame.handle, frame.offset, frame.length);
+                    const sent = this.send(connection, { type: 'mediaChunk', requestId: frame.requestId, deliveryId: frame.deliveryId, handle: frame.handle, offset: frame.offset, data: chunk.data.toString('base64'), eof: chunk.eof });
+                    if (!sent) {
+                        connection.socket.destroy();
+                        return;
+                    }
+                    connection.mediaProgress.set(frame.handle, { deliveryId: frame.deliveryId, offset: frame.offset + chunk.data.length, completed: chunk.eof });
+                } else {
+                    // This acknowledges that the client committed its copy. Router bytes remain
+                    // durable until reply/complete so a disconnect can replay the delivery.
+                    connection.mediaProgress.delete(frame.handle);
+                    if (!this.send(connection, { type: 'mediaReleased', requestId: frame.requestId, deliveryId: frame.deliveryId, handle: frame.handle })) connection.socket.destroy();
+                }
+                return;
+            }
             const result = frame.type === 'reply'
                 ? await this.scheduler.reply(connection.clientId!, frame.requestId, frame.deliveryId, frame.text)
                 : await this.scheduler.complete(connection.clientId!, frame.requestId, frame.deliveryId);
             this.send(connection, result);
         } catch (error) {
-            this.send(connection, { type: 'error', code: 'NOT_AUTHORIZED', message: error instanceof Error ? error.message : String(error), requestId: frame.requestId });
+            if (frame.type === 'mediaRead' || frame.type === 'mediaRelease') {
+                console.warn(`[router] ${frame.type} failed for authenticated client ${connection.clientId}`, error);
+                this.send(connection, { type: 'error', code: 'MEDIA_REQUEST_FAILED', message: 'media request could not be completed', requestId: frame.requestId });
+            } else {
+                this.send(connection, { type: 'error', code: 'NOT_AUTHORIZED', message: error instanceof Error ? error.message : String(error), requestId: frame.requestId });
+            }
         }
     }
 
@@ -205,7 +251,12 @@ export class RouterServer {
         if (this.inbox.has(accountId, routeJid, message.key.id)) return;
         const resolved = extractIncomingText(message.message);
         if (resolved.kind === 'system') return;
-        const reservedBytes = Buffer.byteLength(resolved.text, 'utf8') + (resolved.kind === 'image' ? MAX_IMAGE_BYTES * 2 : 0);
+        const mediaMessage = resolved.kind === 'document' ? resolved.documentMessage : resolved.kind === 'audio' ? resolved.audioMessage : undefined;
+        const declaredMediaBytes = mediaMessage?.fileLength === undefined ? 0 : Number(mediaMessage.fileLength);
+        const mediaPreflightRejected = mediaMessage !== undefined && (!Number.isSafeInteger(declaredMediaBytes) || declaredMediaBytes < 0 ||
+            declaredMediaBytes > MAX_MEDIA_FILE_BYTES || !this.mediaSpool.canAccept(declaredMediaBytes));
+        if (mediaPreflightRejected) console.warn(`[router] media preflight rejected ${message.key.id} for ${routeJid}`);
+        const reservedBytes = Buffer.byteLength(resolved.text, 'utf8') + (resolved.kind === 'image' ? MAX_IMAGE_BYTES * 2 : mediaMessage ? 2048 : 0);
         if (!this.inbox.canAccept(routeJid, reservedBytes)) {
             console.warn(`[router] inbox quota exceeded; dropping ${message.key.id} for ${routeJid}`);
             return;
@@ -213,24 +264,57 @@ export class RouterServer {
         let text = resolved.text;
         if ('quotedMessage' in resolved && resolved.quotedMessage) text = `[Replying to: ${resolved.quotedMessage.quotedText}]\n\n${text}`;
         let image: InlineImage | undefined;
+        let media: MediaHandle | undefined;
         if (resolved.kind === 'image') image = await this.inlineImage(resolved.imageMessage);
-        if (resolved.kind === 'audio') text = '[Audio message is not supported by multiplex v1]';
-        if (resolved.kind === 'video') text = '[Video message is not supported by multiplex v1]';
-        if (resolved.kind === 'document') text = '[Document message is not supported by multiplex v1]';
+        if (resolved.kind === 'video') text = '[Video message is not supported by multiplex]';
+        if (mediaMessage && mediaPreflightRejected) {
+            const fallback = resolved.kind === 'audio'
+                ? '[Audio attachment could not be transferred due to media limits]'
+                : '[Document attachment could not be transferred due to media limits]';
+            text = `${fallback}\n\n${text}`;
+        } else if (mediaMessage) {
+            try {
+                const kind = resolved.kind as 'document' | 'audio';
+                const stream = await downloadContentFromMessage(mediaMessage, kind);
+                media = await this.mediaSpool.create({
+                    inboxKey: this.inbox.keyFor(accountId, routeJid, message.key.id),
+                    accountId, routeJid, clientId, messageId: message.key.id, kind,
+                    mimeType: String(mediaMessage.mimetype || (kind === 'audio' ? 'audio/ogg' : 'application/octet-stream')),
+                    fileName: kind === 'document' ? String(mediaMessage.fileName || 'document') : String(mediaMessage.fileName || 'audio.ogg'),
+                    declaredSize: declaredMediaBytes,
+                    stream
+                });
+            } catch (error) {
+                console.warn(`[router] failed to spool media ${message.key.id}`, error);
+                const fallback = resolved.kind === 'audio' ? '[Audio message could not be transferred]' : '[Document could not be transferred]';
+                text = `${fallback}\n\n${text}`;
+            }
+        }
         text = this.boundedUtf8(text, MAX_TEXT_BYTES);
         const pushName = this.boundedUtf8(message.pushName || 'WhatsApp User', 512);
         const participant = routeJid.endsWith('@g.us')
             ? this.boundedUtf8(message.key.participant?.split('@')[0] || 'unknown', 256)
             : undefined;
-        const payload = { messageId: message.key.id, routeJid, text, pushName, participant, image };
-        const { inserted } = await this.inbox.enqueue({
-            accountId,
-            messageId: message.key.id,
-            routeJid,
-            clientId,
-            payload
-        });
-        if (inserted) await this.scheduler.notifyQueued();
+        const payload = { messageId: message.key.id, routeJid, text, pushName, participant, image, media };
+        try {
+            const { inserted } = await this.inbox.enqueue({
+                accountId,
+                messageId: message.key.id,
+                routeJid,
+                clientId,
+                payload
+            });
+            if (!inserted && media) await this.mediaSpool.release(media.handle);
+            if (inserted) await this.scheduler.notifyQueued();
+        } catch (error) {
+            if (media) await this.mediaSpool.release(media.handle).catch(() => undefined);
+            throw error;
+        }
+    }
+
+    private async reconcileMedia(): Promise<void> {
+        const missing = await this.mediaSpool.reconcile(this.inbox.activeMediaHandles());
+        await this.inbox.replaceMissingMedia(missing);
     }
 
     private boundedUtf8(value: string, maxBytes: number): string {

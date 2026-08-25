@@ -7,12 +7,15 @@ export interface OutboundSender {
     send(routeJid: string, text: string): Promise<{ success: boolean; messageId?: string; error?: string }>;
 }
 type Deliver = (frame: ServerFrame) => boolean;
+export interface SchedulerLifecycle {
+    onFinished(record: InboxRecord, mediaHandle?: string): Promise<void> | void;
+}
 
 export class RouteScheduler {
     private clients = new Map<string, Deliver>();
     private scheduling = false;
     private scheduleRequested = false;
-    constructor(private readonly inbox: DurableInbox, private readonly sender: OutboundSender) {}
+    constructor(private readonly inbox: DurableInbox, private readonly sender: OutboundSender, private readonly lifecycle?: SchedulerLifecycle) {}
 
     hasClient(clientId: string): boolean { return this.clients.has(clientId); }
 
@@ -77,7 +80,9 @@ export class RouteScheduler {
         } catch (error) {
             result = { requestId, status: 'ambiguous', error: error instanceof Error ? error.message : String(error) };
         }
+        const mediaHandle = record.payload?.media?.handle;
         await this.inbox.finish(record.key, result);
+        await this.finished(record, mediaHandle);
         await this.schedule();
         return this.toFrame(record, result);
     }
@@ -86,8 +91,10 @@ export class RouteScheduler {
         const duplicate = this.inbox.getByRequestId(requestId);
         if (duplicate && duplicate.state === 'completed') return this.resultFrame(clientId, duplicate, requestId, deliveryId);
         const record = this.ownedInflight(clientId, deliveryId);
+        const mediaHandle = record.payload?.media?.handle;
         const result: PersistedResult = { requestId, status: 'completed' };
         await this.inbox.finish(record.key, result);
+        await this.finished(record, mediaHandle);
         await this.schedule();
         return this.toFrame(record, result);
     }
@@ -102,10 +109,19 @@ export class RouteScheduler {
         };
     }
 
+    authorizeMedia(clientId: string, deliveryId: string, handle: string): InboxRecord {
+        const record = this.ownedInflight(clientId, deliveryId);
+        if (!record.payload?.media || record.payload.media.handle !== handle) throw new Error('media is not bound to this delivery');
+        return record;
+    }
     private ownedInflight(clientId: string, deliveryId: string): InboxRecord {
         const record = this.inbox.getByDeliveryId(deliveryId);
         if (!record || record.state !== 'inflight' || record.clientId !== clientId) throw new Error('delivery is not active for this client');
         return record;
+    }
+    private async finished(record: InboxRecord, mediaHandle?: string): Promise<void> {
+        try { await this.lifecycle?.onFinished(record, mediaHandle); }
+        catch (error) { console.warn('[router] failed to clean completed delivery media', error); }
     }
     private resultFrame(clientId: string, record: InboxRecord, requestId: string, deliveryId: string): ServerFrame {
         if (record.clientId !== clientId || !record.result || record.deliveryId !== deliveryId) throw new Error('request ID belongs to another delivery');

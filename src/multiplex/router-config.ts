@@ -1,5 +1,6 @@
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { lstat, readFile } from 'node:fs/promises';
+import { isValidClientId } from './protocol.js';
 
 export interface RouterConfig {
     socketPath: string;
@@ -39,8 +40,8 @@ export function parseRouterConfig(value: unknown): RouterConfig {
     for (const item of raw.clients) {
         if (!item || typeof item !== 'object' || Array.isArray(item)) throw new Error('invalid client');
         const client = item as Record<string, unknown>;
-        if (Object.keys(client).some(k => !['id', 'tokenHash'].includes(k)) || typeof client.id !== 'string' ||
-            !/^[a-zA-Z0-9._-]{1,64}$/.test(client.id) || typeof client.tokenHash !== 'string' || !/^[a-f0-9]{64}$/i.test(client.tokenHash)) throw new Error('invalid client');
+        if (Object.keys(client).some(k => !['id', 'tokenHash'].includes(k)) || !isValidClientId(client.id) ||
+            typeof client.tokenHash !== 'string' || !/^[a-f0-9]{64}$/i.test(client.tokenHash)) throw new Error('invalid client');
         if (tokenHashes.has(client.id)) throw new Error(`duplicate client: ${client.id}`);
         const normalizedHash = client.tokenHash.toLowerCase();
         if (usedHashes.has(normalizedHash)) throw new Error('duplicate client token hash');

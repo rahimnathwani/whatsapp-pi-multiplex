@@ -4,6 +4,7 @@ import { IncomingMediaService } from '../../src/services/incoming-media.service.
 const mocks = vi.hoisted(() => ({
     downloadContentFromMessage: vi.fn(),
     mkdir: vi.fn().mockResolvedValue(undefined),
+    readFile: vi.fn().mockResolvedValue(Buffer.from('local pdf')),
     writeFile: vi.fn().mockResolvedValue(undefined),
     pdfParse: vi.fn()
 }));
@@ -14,6 +15,7 @@ vi.mock('baileys', () => ({
 
 vi.mock('node:fs/promises', () => ({
     mkdir: mocks.mkdir,
+    readFile: mocks.readFile,
     writeFile: mocks.writeFile
 }));
 
@@ -103,7 +105,8 @@ describe('IncomingMediaService', () => {
         );
         expect(mocks.writeFile).toHaveBeenCalledWith(
             expect.stringMatching(/whatsapp-medias[\\/]video_1234567890\.mp4$/),
-            Buffer.from('media')
+            Buffer.from('media'),
+            { mode: 0o600 }
         );
         expect(result.text).toContain('[Video saved:');
     });
@@ -142,12 +145,13 @@ describe('IncomingMediaService', () => {
             'document'
         );
         expect(mocks.mkdir).toHaveBeenCalledWith(
-            expect.stringMatching(/\.pi-data[/\\]whatsapp[/\\]documents/),
-            { recursive: true }
+            expect.stringMatching(/whatsapp-medias[/\\]documents/),
+            { recursive: true, mode: 0o700 }
         );
         expect(mocks.writeFile).toHaveBeenCalledWith(
-            expect.stringContaining('1234567890_contract.pdf'),
-            Buffer.from('media')
+            expect.stringMatching(/whatsapp-medias[/\\]documents[/\\][a-f0-9-]+-contract\.pdf$/),
+            Buffer.from('media'),
+            { mode: 0o600 }
         );
         expect(mocks.pdfParse).toHaveBeenCalledWith(Buffer.from('media'));
         expect(result.text).toContain('[Document Received: contract.pdf]');
@@ -157,6 +161,26 @@ describe('IncomingMediaService', () => {
         expect(result.text).toContain('First line');
         expect(result.text).toContain('Description: Read this');
         expect(result.text).not.toContain('A'.repeat(1300));
+    });
+
+    it('processes an already materialized local document with safe display metadata', async () => {
+        const service = new IncomingMediaService(audioService as any);
+        mocks.pdfParse.mockResolvedValueOnce({ text: 'Local PDF body' });
+
+        const result = await service.processLocalDocument('/client/private/report.pdf', {
+            fileName: '../../unsafe report.pdf',
+            mimeType: 'application/pdf',
+            size: 2048,
+            caption: 'Quarterly report'
+        });
+
+        expect(mocks.readFile).toHaveBeenCalledWith('/client/private/report.pdf');
+        expect(mocks.pdfParse).toHaveBeenCalledWith(Buffer.from('local pdf'));
+        expect(result.text).toContain('[Document Received: unsafe_report.pdf]');
+        expect(result.text).toContain('Location: /client/private/report.pdf');
+        expect(result.text).toContain('Local PDF body');
+        expect(result.text).toContain('Description: Quarterly report');
+        expect(result.text).not.toContain('../');
     });
 
     it('falls back gracefully when pdf parsing fails', async () => {
@@ -174,7 +198,7 @@ describe('IncomingMediaService', () => {
         }, 'Ana');
 
         expect(result.text).toContain('[Document Received: scanned.pdf]');
-        expect(result.text).toContain('Location: ./.pi-data/whatsapp/documents/1234567890_scanned.pdf');
+        expect(result.text).toMatch(/Location: .*whatsapp-medias[/\\]documents[/\\][a-f0-9-]+-scanned\.pdf/);
         expect(result.text).toContain('PDF text was not extracted automatically. The file is saved at the path above.');
         expect(result.text).not.toContain('PDF text preview:');
     });

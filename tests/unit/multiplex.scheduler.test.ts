@@ -120,6 +120,30 @@ describe('durable inbox and route scheduler', () => {
         expect(sender).toHaveBeenCalledTimes(1);
     });
 
+    it('authorizes media only for the owning active lease and runs terminal cleanup without disconnect cleanup', async () => {
+        const { inbox } = await createInbox();
+        const handle = 'A'.repeat(43);
+        await inbox.enqueue({
+            accountId: 'account', messageId: 'media', routeJid: '12001@g.us', clientId: 'a',
+            payload: { messageId: 'media', routeJid: '12001@g.us', text: 'doc', pushName: 'Alice', media: { handle, kind: 'document', mimeType: 'application/pdf', size: 1, sha256: 'a'.repeat(64) } }
+        });
+        const cleaned: string[] = [];
+        const scheduler = new RouteScheduler(inbox, readySender(vi.fn()), { onFinished: (_record, mediaHandle) => { if (mediaHandle) cleaned.push(mediaHandle); } });
+        const frames: ServerFrame[] = [];
+        await scheduler.connect('a', frame => { frames.push(frame); return true; });
+        const lease = deliveries(frames)[0].deliveryId;
+        expect(scheduler.authorizeMedia('a', lease, handle).messageId).toBe('media');
+        expect(() => scheduler.authorizeMedia('b', lease, handle)).toThrow('not active');
+        expect(() => scheduler.authorizeMedia('a', lease, 'B'.repeat(43))).toThrow('not bound');
+        await scheduler.disconnect('a');
+        expect(cleaned).toEqual([]);
+        await scheduler.connect('a', frame => { frames.push(frame); return true; });
+        const replay = deliveries(frames).at(-1)!.deliveryId;
+        expect(() => scheduler.authorizeMedia('a', lease, handle)).toThrow('not active');
+        await scheduler.complete('a', 'done', replay);
+        expect(cleaned).toEqual([handle]);
+    });
+
     it('gates replay until the outbound sender is ready', async () => {
         const { inbox } = await createInbox();
         await enqueue(inbox, '12001@g.us', 'a', 'm1');

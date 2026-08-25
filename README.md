@@ -80,7 +80,7 @@ npm install
 The CLI is expected at `vendor/whisper.cpp/build/bin/whisper-cli` (or `.exe` on Windows). To use another location, set `WHISPER_CLI_PATH`.
 
 PDF documents are parsed locally and do not require extra system utilities.
-If a PDF cannot be parsed automatically, it is still saved and forwarded with a clear fallback notice.
+If a PDF cannot be parsed automatically, it is still saved and forwarded with a clear fallback notice. LiteParse is an optional dependency: installations using `npm install --omit=optional` retain document transfer and private local paths but omit automatic PDF text previews.
 
 ## Quick Start
 
@@ -182,15 +182,16 @@ sudo -iu agent01 tmux attach -t whatsapp-pi-agent01
 
 `whatsapp-pi` socket-group membership permits connection but not route claims. The router authenticates the client token and derives the outbound JID exclusively from its persisted delivery lease. A second live connection for a client is rejected. Router state stays mode `0700`; agent homes/credential directories are mode `0700` and tokens mode `0600`.
 
-### v1 semantics and limits
+### Multiplex product v1 semantics and IPC protocol v2 limits
 
 - Exact static routes only; no wildcard or default route. One in-flight delivery per route, with concurrency across routes.
 - Live Baileys `notify` upserts are iterated and durably deduplicated before dispatch. Offline clients receive queued messages after reconnect/restart.
 - Delivery to Pi is **at least once**, not exactly once. The router persists a `sending` boundary before calling WhatsApp; a daemon crash at that boundary is recovered as terminally ambiguous and is not redelivered. WhatsApp itself still cannot provide a transactional exactly-once guarantee.
-- IPC is protocol v1 strict NDJSON. Client frames are capped at 272 KiB (4 KiB before authentication), text at 256 KiB, and inline images at 5 MiB. Connections, frames per read, and control-frame rate are bounded. Audio, video, and documents are placeholders in v1; daemon filesystem paths are never sent.
+- IPC is protocol v2 strict NDJSON. Client frames are capped at 272 KiB (4 KiB before authentication), media chunks at 192 KiB, text at 256 KiB, and inline images at 5 MiB. Documents and audio are streamed through a router-private durable spool using opaque delivery-bound handles, then verified and atomically materialized as mode-0600 files beneath the client user's private storage. Router filesystem paths are never sent. Video remains unsupported in multiplex mode.
+- Each client's materialized multiplex-media cache is limited to 100 files and 250 MiB. Files older than 7 days and least-recently-written files above those limits are removed before startup/materialization; cleanup occurs before the new active document is committed. Audio remains ephemeral and is removed immediately after transcription.
 - Client mode disables `/whatsapp` connection/config ownership, reactions, and arbitrary-JID outbound sends. Replies are scoped to the immutable active delivery ID.
-- The compact JSON inbox is intended for the bounded 20-route/low-volume v1. It allows at most 100 active records per route, 1,000 active records globally, and 100 MiB of retained payloads. Completed payloads are reduced to tombstones; tombstones expire after 7 days and are capped at 10,000. It is atomically replaced and fsynced, but SQLite may be preferable for sustained high volume.
-- An active lease has no daemon-side turn timeout in v1. A wedged client must disconnect/restart so the router requeues that delivery.
+- The compact JSON inbox is intended for the bounded 20-route/low-volume deployment. It allows at most 100 active records per route, 1,000 active records globally, and 100 MiB of retained JSON payloads. The separate media spool allows 25 MiB per file and 250 MiB total, reconciles crash leftovers, and expires abandoned data. Completed payloads are reduced to tombstones; tombstones expire after 7 days and are capped at 10,000. Snapshots are atomically replaced and fsynced, but SQLite may be preferable for sustained high volume.
+- An active lease has no daemon-side turn timeout in the current multiplex product. A wedged client must disconnect/restart so the router requeues that delivery.
 - Unix socket permissions and systemd hardening are Linux-oriented. Cross-UID isolation must be validated on the target host.
 
 ### Multiplex test quickstart
@@ -320,6 +321,6 @@ npm test
 
 - `--whatsapp-pi-online` auto-connects when credentials already exist.
 - `--whatsapp-group <jid>` binds Pi to one WhatsApp group.
-- Media handling is local: images for vision, audio via Whisper.cpp + ffmpeg, documents stored under `.pi-data/whatsapp/documents/`.
+- Media handling is local: images for vision, audio via Whisper.cpp + ffmpeg, and documents stored as private files under `~/.pi/agent/extensions/whatsapp-pi/whatsapp-medias/`.
 - Recents/history live in `~/.pi/agent/extensions/whatsapp-pi/recents/recents.json`.
 - Session state, allow lists, and startup reconnects are persisted locally.

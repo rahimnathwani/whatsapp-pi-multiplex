@@ -43,8 +43,10 @@ const mocks = vi.hoisted(() => {
     });
 
     const createIncomingMediaService = () => ({
-        process: vi.fn().mockResolvedValue({ text: 'hello from whatsapp' })
+        process: vi.fn().mockResolvedValue({ text: 'hello from whatsapp' }),
+        processLocalDocument: vi.fn().mockResolvedValue({ text: '[Document Received: report.pdf]\nLocation: /client/private/report.pdf' })
     });
+    const createAudioService = () => ({ transcribeFile: vi.fn().mockResolvedValue('voice text') });
 
     return {
         sessionManager: createSessionManager(),
@@ -52,12 +54,14 @@ const mocks = vi.hoisted(() => {
         recentsService: createRecentsService(),
         menuHandler: createMenuHandler(),
         incomingMediaService: createIncomingMediaService(),
+        audioService: createAudioService(),
         multiplexClient: {
             start: vi.fn().mockResolvedValue(undefined),
             stop: vi.fn().mockResolvedValue(undefined),
             onDelivery: vi.fn(),
             reply: vi.fn().mockResolvedValue({ type: 'replyResult', requestId: 'r', deliveryId: 'd', status: 'sent' }),
-            complete: vi.fn().mockResolvedValue({ type: 'replyResult', requestId: 'r', deliveryId: 'd', status: 'completed' })
+            complete: vi.fn().mockResolvedValue({ type: 'replyResult', requestId: 'r', deliveryId: 'd', status: 'completed' }),
+            fetchMedia: vi.fn()
         },
         extractIncomingText: vi.fn().mockReturnValue({ kind: 'text', text: 'hello from whatsapp' }),
         reset() {
@@ -66,12 +70,14 @@ const mocks = vi.hoisted(() => {
             this.recentsService = createRecentsService();
             this.menuHandler = createMenuHandler();
             this.incomingMediaService = createIncomingMediaService();
+            this.audioService = createAudioService();
             this.multiplexClient = {
                 start: vi.fn().mockResolvedValue(undefined),
                 stop: vi.fn().mockResolvedValue(undefined),
                 onDelivery: vi.fn(),
                 reply: vi.fn().mockResolvedValue({ type: 'replyResult', requestId: 'r', deliveryId: 'd', status: 'sent' }),
-                complete: vi.fn().mockResolvedValue({ type: 'replyResult', requestId: 'r', deliveryId: 'd', status: 'completed' })
+                complete: vi.fn().mockResolvedValue({ type: 'replyResult', requestId: 'r', deliveryId: 'd', status: 'completed' }),
+                fetchMedia: vi.fn()
             };
             this.extractIncomingText = vi.fn().mockReturnValue({ kind: 'text', text: 'hello from whatsapp' });
         }
@@ -93,7 +99,7 @@ vi.mock('../../src/services/recents.service.ts', () => ({
 }));
 
 vi.mock('../../src/services/audio.service.ts', () => ({
-    AudioService: vi.fn(() => ({}))
+    AudioService: vi.fn(() => mocks.audioService)
 }));
 
 vi.mock('../../src/ui/menu.handler.ts', () => ({
@@ -331,6 +337,92 @@ describe('whatsapp-pi message_end handler', () => {
         expect(mocks.multiplexClient.reply).not.toHaveBeenCalled();
         await pi.handlers.get('agent_settled')!({}, ctx);
         expect(mocks.multiplexClient.reply).toHaveBeenCalledWith('d1', 'routed reply');
+    });
+
+    it('materializes and processes a multiplex document before assigning the active prompt scope', async () => {
+        vi.stubEnv('WHATSAPP_PI_CREDENTIAL_FILE', '/private/token');
+        let resolveFetch!: (value: any) => void;
+        mocks.multiplexClient.fetchMedia.mockReturnValue(new Promise(resolve => { resolveFetch = resolve; }));
+        const registerExtension = await loadExtension();
+        const pi = createMockPi(true);
+        const ctx = createMockContext();
+        registerExtension(pi as any);
+        await pi.handlers.get('session_start')!({}, ctx);
+        const onDelivery = mocks.multiplexClient.onDelivery.mock.calls[0][0];
+        const media = { handle: 'A'.repeat(43), kind: 'document', mimeType: 'application/pdf', fileName: '../../report.pdf', size: 3, sha256: 'a'.repeat(64) };
+        onDelivery({ deliveryId: 'doc-delivery', messageId: 'm-doc', routeJid: '12001@g.us', text: 'caption', pushName: 'Alice', media });
+        expect(pi.sendUserMessage).not.toHaveBeenCalled();
+        const toolBeforeReady = await pi.tools.get('send_wa_message').execute('tool', { message: 'too early' });
+        expect(toolBeforeReady.isError).toBe(true);
+        resolveFetch({ ...media, fileName: 'report.pdf', path: '/client/private/report.pdf' });
+        await vi.waitFor(() => expect(pi.sendUserMessage).toHaveBeenCalledTimes(1));
+        expect(mocks.incomingMediaService.processLocalDocument).toHaveBeenCalledWith('/client/private/report.pdf', expect.objectContaining({ mimeType: 'application/pdf', caption: 'caption' }));
+        expect(pi.sendUserMessage.mock.calls[0][0]).toContain('/client/private/report.pdf');
+        expect(pi.sendUserMessage.mock.calls[0][0]).not.toContain('/var/lib');
+    });
+
+    it('falls back after a media fetch failure and continues to the queued delivery', async () => {
+        vi.stubEnv('WHATSAPP_PI_CREDENTIAL_FILE', '/private/token');
+        mocks.multiplexClient.fetchMedia.mockRejectedValueOnce(new Error('transfer failed'));
+        const registerExtension = await loadExtension();
+        const pi = createMockPi(true);
+        const ctx = createMockContext();
+        registerExtension(pi as any);
+        await pi.handlers.get('session_start')!({}, ctx);
+        const onDelivery = mocks.multiplexClient.onDelivery.mock.calls[0][0];
+        const media = { handle: 'C'.repeat(43), kind: 'document', mimeType: 'application/pdf', fileName: 'failed.pdf', size: 3, sha256: 'c'.repeat(64) };
+        onDelivery({ deliveryId: 'failed-media', messageId: 'm-failed', routeJid: '12001@g.us', text: 'caption', pushName: 'Alice', media });
+        onDelivery({ deliveryId: 'successor', messageId: 'm-next', routeJid: '12001@g.us', text: 'next message', pushName: 'Alice' });
+        await vi.waitFor(() => expect(pi.sendUserMessage).toHaveBeenCalledTimes(1));
+        expect(pi.sendUserMessage.mock.calls[0][0]).toContain('failed.pdf could not be prepared');
+
+        await pi.handlers.get('agent_start')!({}, ctx);
+        await pi.handlers.get('agent_end')!({ messages: [] }, ctx);
+        await pi.handlers.get('agent_settled')!({}, ctx);
+
+        await vi.waitFor(() => expect(pi.sendUserMessage).toHaveBeenCalledTimes(2));
+        expect(pi.sendUserMessage.mock.calls[1][0]).toContain('next message');
+    });
+
+    it('transcribes multiplex audio before delivering the prompt', async () => {
+        vi.stubEnv('WHATSAPP_PI_CREDENTIAL_FILE', '/private/token');
+        const media = { handle: 'B'.repeat(43), kind: 'audio', mimeType: 'audio/ogg', fileName: 'voice.ogg', size: 3, sha256: 'b'.repeat(64) };
+        mocks.multiplexClient.fetchMedia.mockResolvedValue({ ...media, path: '/client/private/voice.ogg' });
+        const registerExtension = await loadExtension();
+        const pi = createMockPi(true);
+        const ctx = createMockContext();
+        registerExtension(pi as any);
+        await pi.handlers.get('session_start')!({}, ctx);
+        mocks.multiplexClient.onDelivery.mock.calls[0][0]({ deliveryId: 'audio-delivery', messageId: 'm-audio', routeJid: '12001@g.us', text: '[Audio]', pushName: 'Alice', media });
+        await vi.waitFor(() => expect(pi.sendUserMessage).toHaveBeenCalledTimes(1));
+        expect(mocks.audioService.transcribeFile).toHaveBeenCalledWith('/client/private/voice.ogg');
+        expect(pi.sendUserMessage.mock.calls[0][0]).toContain('[Transcribed Audio]: voice text');
+    });
+
+    it('removes materialized audio even when transcription unexpectedly rejects', async () => {
+        vi.stubEnv('WHATSAPP_PI_CREDENTIAL_FILE', '/private/token');
+        const { mkdtemp, rm, stat, writeFile } = await import('node:fs/promises');
+        const { join } = await import('node:path');
+        const { tmpdir } = await import('node:os');
+        const directory = await mkdtemp(join(tmpdir(), 'wa-message-audio-'));
+        const path = join(directory, 'voice.ogg');
+        await writeFile(path, 'audio', { mode: 0o600 });
+        const media = { handle: 'D'.repeat(43), kind: 'audio', mimeType: 'audio/ogg', fileName: 'voice.ogg', size: 5, sha256: 'd'.repeat(64) };
+        mocks.multiplexClient.fetchMedia.mockResolvedValue({ ...media, path });
+        mocks.audioService.transcribeFile.mockRejectedValueOnce(new Error('unexpected failure'));
+        try {
+            const registerExtension = await loadExtension();
+            const pi = createMockPi(true);
+            const ctx = createMockContext();
+            registerExtension(pi as any);
+            await pi.handlers.get('session_start')!({}, ctx);
+            mocks.multiplexClient.onDelivery.mock.calls[0][0]({ deliveryId: 'failed-audio', messageId: 'm-audio-fail', routeJid: '12001@g.us', text: '[Audio]', pushName: 'Alice', media });
+            await vi.waitFor(() => expect(pi.sendUserMessage).toHaveBeenCalledTimes(1));
+            expect(pi.sendUserMessage.mock.calls[0][0]).toContain('Audio message could not be prepared');
+            await expect(stat(path)).rejects.toMatchObject({ code: 'ENOENT' });
+        } finally {
+            await rm(directory, { recursive: true, force: true });
+        }
     });
 
     it('waits through tool execution, suppresses final text after a tool reply, and queues the successor delivery', async () => {
