@@ -136,7 +136,10 @@ export class IncomingMediaService {
 
     private async extractPdfPreview(buffer: Buffer): Promise<string | null> {
         try {
-            const { LiteParse } = await import('@llamaindex/liteparse');
+            const optionalModule = '@llamaindex/liteparse';
+            const { LiteParse } = await import(optionalModule) as {
+                LiteParse: new (options: { ocrEnabled: boolean }) => { parse(input: Buffer): Promise<{ text?: string }> };
+            };
             const result = await new LiteParse({ ocrEnabled: true }).parse(buffer);
             return this.formatPdfPreview(result.text);
         } catch (error) {
